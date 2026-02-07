@@ -1,3 +1,4 @@
 [submodule "external/otp"]
 	path = external/otp
 	url = git@github.com:erlang/otp.git
+	branch = maint-28
