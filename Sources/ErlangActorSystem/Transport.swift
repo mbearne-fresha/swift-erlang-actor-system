@@ -31,6 +31,8 @@ public protocol Transport {
     func send(_ message: SendMessage, on socket: AcceptSocket) async throws
     
     func receive(on socket: AcceptSocket) throws -> ReceiveResult
+
+    func close(socket: AcceptSocket)
     
     mutating func makePID() -> Term.PID
     mutating func makeReference() -> Term.Reference

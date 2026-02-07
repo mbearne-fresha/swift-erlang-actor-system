@@ -37,11 +37,48 @@ public final class ErlangActorSystem: DistributedActorSystem, @unchecked Sendabl
     private(set) var nodesMonitors = Set<ActorID>()
     
     private func nodeReady(_ node: (any Transport).AcceptSocket, name: String) async {
+        // Cancel any existing receive loop for this node name (handles reconnection)
+        let oldSocket: (any Transport).AcceptSocket? = self.remoteNodes.withLock { $0[name] }
+        if let oldSocket {
+            let oldTask = self.remoteNodeReceiveLoops.withLock { $0.removeValue(forKey: oldSocket) }
+            oldTask?.cancel()
+            self.transport.close(socket: oldSocket)
+        }
+
         self.remoteNodes.withLock {
             $0[name] = node
         }
         self.remoteNodeReceiveLoops.withLock {
             $0[node] = Task { [weak self] in
+                defer {
+                    // Clean up when the receive loop exits
+                    if let self {
+                        self.remoteNodes.withLock { nodes in
+                            // Only remove if this socket is still the active one for this name
+                            if let current = nodes[name], current == node {
+                                nodes.removeValue(forKey: name)
+                            }
+                        }
+                        _ = self.remoteNodeReceiveLoops.withLock {
+                            $0.removeValue(forKey: node)
+                        }
+                        // Close the socket fd to avoid CLOSE_WAIT
+                        self.transport.close(socket: node)
+                        // Notify monitors that node went down
+                        let monitors = self.processes.withLock { processes in
+                            self.nodesMonitors.compactMap({ monitor in
+                                processes[monitor] as? any NodesMonitor
+                            })
+                        }
+                        Task {
+                            for monitor in monitors {
+                                await monitor.whenLocal { actor in
+                                    actor.down(name)
+                                }
+                            }
+                        }
+                    }
+                }
                 while true {
                     guard !Task.isCancelled else { return }
                     guard let self else { return }
@@ -50,10 +87,12 @@ public final class ErlangActorSystem: DistributedActorSystem, @unchecked Sendabl
                         case .tick:
                             continue
                         case let .success(message):
-                            try! await self.handleMessage(socket: node, message: message)
+                            try? await self.handleMessage(socket: node, message: message)
                         }
                     } catch {
-                        continue
+                        // Receive failed - node disconnected, exit the loop
+                        print("Node \(name) disconnected: \(error)")
+                        return
                     }
                 }
             }
@@ -607,20 +646,28 @@ extension ErlangActorSystem {
                 index: 0
             )
             
-            try! await ErlangActorSystem.$messageInfo.withValue(message.info) {
-                if let stableNamed = actor as? any HasStableNames {
-                    try await stableNamed._executeStableName(
-                        target: RemoteCallTarget(localCall.identifier),
-                        invocationDecoder: &invocationDecoder,
-                        handler: handler
-                    )
-                } else {
-                    try await self.executeDistributedTarget(
-                        on: actor,
-                        target: RemoteCallTarget(localCall.identifier),
-                        invocationDecoder: &invocationDecoder,
-                        handler: handler
-                    )
+            do {
+                try await ErlangActorSystem.$messageInfo.withValue(message.info) {
+                    if let stableNamed = actor as? any HasStableNames {
+                        try await stableNamed._executeStableName(
+                            target: RemoteCallTarget(localCall.identifier),
+                            invocationDecoder: &invocationDecoder,
+                            handler: handler
+                        )
+                    } else {
+                        try await self.executeDistributedTarget(
+                            on: actor,
+                            target: RemoteCallTarget(localCall.identifier),
+                            invocationDecoder: &invocationDecoder,
+                            handler: handler
+                        )
+                    }
+                }
+            } catch {
+                do {
+                    try await handler.onThrow(error: error)
+                } catch {
+                    print("Error handling message '\(localCall.identifier)': \(error)")
                 }
             }
         } else {

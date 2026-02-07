@@ -186,6 +186,12 @@ public final class ErlInterfaceTransport: Transport {
         case unknownMessageKind(Int32)
     }
     
+
+    public func close(socket: AcceptSocket) {
+        self.sockets.removeValue(forKey: socket)
+        CErlInterface.close(socket)
+    }
+
     public func makePID() -> Term.PID {
         var pid = erlang_pid()
         ei_make_pid(&node, &pid)
