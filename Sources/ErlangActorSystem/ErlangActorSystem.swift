@@ -3,6 +3,8 @@ import Distributed
 import Synchronization
 #if canImport(Glibc)
 import Glibc
+#elseif canImport(Darwin)
+import Darwin
 #endif
 
 /// An actor system manages an Erlang C node, which can contain many processes
@@ -199,7 +201,30 @@ public final class ErlangActorSystem: DistributedActorSystem, @unchecked Sendabl
             }
         }
     }
-    
+
+    /// Explicitly shut down the actor system.
+    ///
+    /// Cancels background tasks (accept loop, receive loops), closes remote
+    /// node sockets, and clears the process registry. Clearing the registry
+    /// breaks the retain cycle between the system and its distributed actors
+    /// (system -> processes dict -> actors -> system), allowing deallocation.
+    public func shutdown() {
+        // Ignore SIGPIPE which can occur when closing sockets with pending writes
+        signal(SIGPIPE, SIG_IGN)
+
+        acceptTask?.cancel()
+        acceptTask = nil
+        remoteNodeReceiveLoops.withLock {
+            for task in $0.values { task.cancel() }
+            $0.removeAll()
+        }
+        remoteNodes.withLock {
+            for (_, socket) in $0 { transport.close(socket: socket) }
+            $0.removeAll()
+        }
+        processes.withLock { $0.removeAll() }
+    }
+
     /// Register a name for an actor.
     ///
     /// The actor system will forward messages for this name to the provided actor.

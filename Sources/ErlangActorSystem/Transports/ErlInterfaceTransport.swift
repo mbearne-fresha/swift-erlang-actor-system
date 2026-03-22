@@ -112,16 +112,24 @@ public final class ErlInterfaceTransport: Transport {
         else { throw TransportError.publishFailed }
     }
     
-    public func accept(from listen: ListenSocket) throws -> (socket: AcceptSocket, name: String) {
-        var conn = ErlConnect()
-        let fileDescriptor = ei_accept(&node, listen, &conn)
-        guard fileDescriptor >= 0,
-              let nodeName = String(cString: [CChar](tuple: conn.nodename, start: \.0), encoding: .utf8)
-        else { throw TransportError.acceptFailed }
-        
-        self.sockets[fileDescriptor] = Socket(socket: fileDescriptor)
-        
-        return (socket: fileDescriptor, name: nodeName)
+    public func accept(from listen: ListenSocket) async throws -> (socket: AcceptSocket, name: String) {
+        // Use ei_accept_tmo() with a short timeout instead of blocking ei_accept().
+        // This prevents starving the Swift cooperative thread pool, since each call
+        // only blocks for at most 200ms before yielding.
+        while true {
+            var conn = ErlConnect()
+            let fileDescriptor = ei_accept_tmo(&node, listen, &conn, 200)
+
+            if fileDescriptor >= 0,
+               let nodeName = String(cString: [CChar](tuple: conn.nodename, start: \.0), encoding: .utf8) {
+                self.sockets[fileDescriptor] = Socket(socket: fileDescriptor)
+                return (socket: fileDescriptor, name: nodeName)
+            }
+
+            // Timeout or error — check for task cancellation and yield
+            try Task.checkCancellation()
+            await Task.yield()
+        }
     }
     
     public func connect(to nodeName: String) throws -> AcceptSocket {
